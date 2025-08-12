@@ -32,7 +32,8 @@ static OpticalFlowIntegration g_of; // single-device assumption for this minimal
 // Environment toggle: test_vk=1 enables overlay
 static bool g_enabled = [](){ const char* v = std::getenv("test_vk"); return v && std::strcmp(v, "0") != 0; }();
 static bool g_of_enabled = [](){ const char* v = std::getenv("TEST_VK_OF"); return v && std::strcmp(v, "0") != 0; }();
-static void log_debug(const char* msg){ if(g_enabled) std::fprintf(stderr, "[test_vk] %s\n", msg); }
+// Log if either overlay OR optical flow is enabled so OF-only runs still produce diagnostics.
+static void log_debug(const char* msg){ if(g_enabled || g_of_enabled) std::fprintf(stderr, "[test_vk] %s\n", msg); }
 
 // Next layer function pointers (global simple approach)
 static PFN_vkGetInstanceProcAddr g_nextGetInstanceProcAddr = nullptr;
@@ -248,6 +249,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, c
     std::lock_guard<std::mutex> lock(g_mutex);
     g_device_dispatch[*pDevice] = d;
     log_debug("vkCreateDevice intercepted");
+    if(g_enabled || g_of_enabled){
+        std::fprintf(stderr, "[test_vk] flags: overlay=%d opticalflow=%d\n", (int)g_enabled, (int)g_of_enabled);
+    }
     if(g_of_enabled){
         size_t scratchSize = ffxGetScratchMemorySizeVK(physicalDevice, FFX_OPTICALFLOW_CONTEXT_COUNT);
         g_of.scratch.resize(scratchSize);
@@ -310,9 +314,28 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentI
     }
     if(!ddt || !idt || !ddt->QueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
 
-    if(g_of_enabled && !g_of.contextCreated && g_of.backendInterface.fpGetSDKVersion){
-        FfxOpticalflowContextDescription desc{}; desc.backendInterface = g_of.backendInterface; desc.flags=0; desc.resolution.width = g_of.extent.width?g_of.extent.width:1024; desc.resolution.height = g_of.extent.height?g_of.extent.height:1024;
-        if(ffxOpticalflowContextCreate(&g_of.context, &desc)==FFX_OK){ g_of.contextCreated=true; g_of.pendingReset=true; log_debug("Optical Flow context created"); } else { log_debug("Optical Flow context create failed"); g_of_enabled=false; }
+    static bool s_loggedStateOnce = false;
+    if(!s_loggedStateOnce){
+        s_loggedStateOnce = true;
+        std::fprintf(stderr, "[test_vk] Present state: overlay=%d of_enabled=%d of_ctx=%d backend=%p extent=%ux%u\n",
+            (int)g_enabled, (int)g_of_enabled, (int)g_of.contextCreated, (void*)g_of.backendInterface.fpGetSDKVersion,
+            g_of.extent.width, g_of.extent.height);
+    }
+    if(g_of_enabled && !g_of.contextCreated){
+        if(!g_of.backendInterface.fpGetSDKVersion){
+            log_debug("Optical Flow: backend interface not initialized yet");
+        } else {
+            uint32_t w = g_of.extent.width?g_of.extent.width:1024;
+            uint32_t h = g_of.extent.height?g_of.extent.height:1024;
+            FfxOpticalflowContextDescription desc{}; desc.backendInterface = g_of.backendInterface; desc.flags=0; desc.resolution.width = w; desc.resolution.height = h;
+            log_debug("Optical Flow: attempting context create");
+            if(ffxOpticalflowContextCreate(&g_of.context, &desc)==FFX_OK){
+                g_of.contextCreated=true; g_of.pendingReset=true; log_debug("Optical Flow: context created");
+            } else {
+                log_debug("Optical Flow: context create FAILED");
+                g_of_enabled=false;
+            }
+        }
     }
     if(!g_enabled && !g_of_enabled) return ddt->QueuePresentKHR(queue, pPresentInfo);
     if(g_enabled) log_debug("vkQueuePresentKHR overlay path");
@@ -431,6 +454,18 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwa
     if(r==VK_SUCCESS && g_of_enabled){
         if(g_of.extent.width != pCreateInfo->imageExtent.width || g_of.extent.height != pCreateInfo->imageExtent.height){ g_of.pendingReset = true; }
         g_of.extent = {pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height};
+        log_debug("Optical Flow: swapchain extent captured");
+        // Try context create here as well (some apps may present late)
+        if(!g_of.contextCreated && g_of.backendInterface.fpGetSDKVersion){
+            FfxOpticalflowContextDescription desc{}; desc.backendInterface = g_of.backendInterface; desc.flags=0; desc.resolution.width = g_of.extent.width; desc.resolution.height = g_of.extent.height;
+            log_debug("Optical Flow: attempting context create (swapchain)");
+            if(ffxOpticalflowContextCreate(&g_of.context, &desc)==FFX_OK){
+                g_of.contextCreated=true; g_of.pendingReset=true; log_debug("Optical Flow: context created (swapchain)");
+            } else {
+                log_debug("Optical Flow: context create FAILED (swapchain)");
+                g_of_enabled=false;
+            }
+        }
     }
     return r;
 }

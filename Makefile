@@ -5,7 +5,7 @@
 ##   make clean
 
 CXX ?= g++
-CXXFLAGS ?= -O2 -g -fPIC -std=c++17 -Wall -Wextra -Wno-unused-parameter -DFFX_OF -include layers/ffx_compat.h
+CXXFLAGS ?= -O2 -g -fPIC -std=c++17 -Wall -Wextra -Wno-unused-parameter -DFFX_OF -include layers/ffx_compat.h -MMD -MP
 
 FFX_SDK_DIR := third_party/FidelityFX-SDK/sdk
 
@@ -18,7 +18,7 @@ LDFLAGS ?= -shared
 LDLIBS ?= -lvulkan
 
 LIB = libVK_LAYER_LUNARG_test_vk.so
-LAYER_SRC = layers/hello_layer.cpp
+LAYER_SRC = layers/hello_layer.cpp layers/ffx_framegen_stub.cpp
 
 # Minimal subset of FidelityFX SDK sources needed for Optical Flow (vk backend + shared + opticalflow component)
 FFX_SRC = \
@@ -31,11 +31,16 @@ FFX_SRC = \
 	$(FFX_SDK_DIR)/src/shared/ffx_breadcrumbs_list.cpp
 
 SRC = $(LAYER_SRC) $(FFX_SRC)
+OBJ = $(SRC:.cpp=.o)
+DEPS = $(OBJ:.o=.d)
 
 all: $(LIB)
 
-$(LIB): $(SRC)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $(SRC) -o $@ $(LDFLAGS) $(LDLIBS)
+$(LIB): $(OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS) $(LDLIBS)
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 install: $(LIB)
 	install -Dm755 $(LIB) "$(HOME)/.local/lib/$(LIB)"
@@ -44,6 +49,8 @@ install: $(LIB)
 	@echo "Manifest:  $(HOME)/.local/share/vulkan/explicit_layer.d/VK_LAYER_LUNARG_test_vk.json"
 
 clean:
-	rm -f $(LIB)
+	rm -f $(LIB) $(OBJ) $(DEPS)
+
+-include $(DEPS)
 
 .PHONY: all install clean
