@@ -1,0 +1,15 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_LUNARG_test_vk",
+    "type": "INSTANCE",
+  "library_path": "/home/kurt/.local/lib/libVK_LAYER_LUNARG_test_vk.so",
+    "api_version": "1.3.275",
+  "implementation_version": "1",
+  "description": "Test VK Hello overlay explicit layer (HELLO WORLD when test_vk=1)",
+  "instance_extensions": [],
+  "device_extensions": [],
+  "disable_environment": {},
+  "enable_environment": {}
+  }
+}

@@ -1,0 +1,471 @@
+#include <vulkan/vulkan.h>
+#include <vulkan/vk_layer.h>
+#include <cstring>
+#include <cstdlib>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <unordered_map>
+#include <cstdio>
+#include <array>
+
+// Simple implicit layer that overlays "Hello world" in the top-left (or right by adjusting coordinates)
+// of any swapchain image by drawing a tiny CPU-side RGBA8 bitmap copied via vkCmdCopyBufferToImage
+// after the app's render pass ends (hooking Present). Kept intentionally very small.
+
+// Environment toggle: test_vk=1 enables overlay
+static bool g_enabled = [](){ const char* v = std::getenv("test_vk"); return v && std::strcmp(v, "0") != 0; }();
+static void log_debug(const char* msg){ if(g_enabled) std::fprintf(stderr, "[test_vk] %s\n", msg); }
+
+// Next layer function pointers (global simple approach)
+static PFN_vkGetInstanceProcAddr g_nextGetInstanceProcAddr = nullptr;
+static PFN_vkGetDeviceProcAddr   g_nextGetDeviceProcAddr   = nullptr;
+
+// Function pointer dispatch tables
+struct InstanceDispatchTable {
+    PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+    PFN_vkCreateInstance CreateInstance;
+    PFN_vkDestroyInstance DestroyInstance;
+    PFN_vkCreateDevice CreateDevice;
+    PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
+    PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;
+    PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
+    PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
+};
+
+struct DeviceDispatchTable {
+    PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
+    PFN_vkDestroyDevice DestroyDevice;
+    PFN_vkGetDeviceQueue GetDeviceQueue;
+    PFN_vkQueuePresentKHR QueuePresentKHR;
+    PFN_vkQueueSubmit QueueSubmit;
+    PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
+    PFN_vkFreeCommandBuffers FreeCommandBuffers;
+    PFN_vkBeginCommandBuffer BeginCommandBuffer;
+    PFN_vkEndCommandBuffer EndCommandBuffer;
+    PFN_vkResetCommandBuffer ResetCommandBuffer;
+    PFN_vkCreateFence CreateFence;
+    PFN_vkWaitForFences WaitForFences;
+    PFN_vkDestroyFence DestroyFence;
+    PFN_vkCreateBuffer CreateBuffer;
+    PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements;
+    PFN_vkAllocateMemory AllocateMemory;
+    PFN_vkBindBufferMemory BindBufferMemory;
+    PFN_vkCreateCommandPool CreateCommandPool;
+    PFN_vkDestroyCommandPool DestroyCommandPool;
+    PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+    PFN_vkCreateImage CreateImage;
+    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
+    PFN_vkBindImageMemory BindImageMemory;
+    PFN_vkMapMemory MapMemory;
+    PFN_vkUnmapMemory UnmapMemory;
+    PFN_vkDestroyImage DestroyImage;
+    PFN_vkDestroyBuffer DestroyBuffer;
+    PFN_vkCreateSwapchainKHR CreateSwapchainKHR;
+    PFN_vkDestroySwapchainKHR DestroySwapchainKHR;
+    PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR;
+    VkPhysicalDevice physicalDevice{};
+};
+
+static std::mutex g_mutex;
+static std::unordered_map<VkInstance, InstanceDispatchTable> g_instance_dispatch;
+static std::unordered_map<VkDevice, DeviceDispatchTable> g_device_dispatch;
+static std::unordered_map<VkQueue, VkDevice> g_queue_to_device;
+
+struct SwapchainInfo {
+    VkDevice device{};
+    uint32_t width{};
+    uint32_t height{};
+    std::vector<VkImage> images; // filled after GetSwapchainImagesKHR
+};
+static std::unordered_map<VkSwapchainKHR, SwapchainInfo> g_swapchains;
+
+static std::unordered_map<VkQueue, uint32_t> g_queue_family_index; // needed for command pool
+
+// Helpers removed (unused after proper chaining)
+
+// Very small monochrome bitmap font for phrase "HELLO WORLD" (fixed phrase) 8 px tall.
+// Each character 6 px wide (5 + 1 space). 11 chars => 66px width.
+static const uint32_t HELLO_H = 8;
+static const uint32_t HELLO_W = 66;
+// Bit patterns (LSB left) for 5x8 glyphs of "HELLO WORLD" with a space after each.
+static std::array<uint8_t, 11*8> hello_pattern{}; // generated at runtime
+
+static void initHelloPattern() {
+    // Glyph definitions for H,E,L,O,W,R,D (5x8). 1 = white.
+    auto glyph = [](char c){
+        switch(c){
+            case 'H': return std::array<uint8_t,8>{0x11,0x11,0x11,0x1F,0x11,0x11,0x11,0x11};
+            case 'E': return std::array<uint8_t,8>{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10,0x1F};
+            case 'L': return std::array<uint8_t,8>{0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x1F};
+            case 'O': return std::array<uint8_t,8>{0x0E,0x11,0x11,0x11,0x11,0x11,0x11,0x0E};
+            case 'W': return std::array<uint8_t,8>{0x11,0x11,0x11,0x15,0x15,0x15,0x0A,0x0A};
+            case 'R': return std::array<uint8_t,8>{0x1E,0x11,0x11,0x1E,0x14,0x12,0x11,0x11};
+            case 'D': return std::array<uint8_t,8>{0x1E,0x11,0x11,0x11,0x11,0x11,0x11,0x1E};
+            default: return std::array<uint8_t,8>{0,0,0,0,0,0,0,0};
+        }
+    };
+    const char* text = "HELLO WORLD"; // length 11
+    for(int ci=0; ci<11; ++ci){
+        char c = text[ci];
+        auto g = (c==' ')? std::array<uint8_t,8>{0,0,0,0,0,0,0,0} : glyph(c);
+        for(int row=0; row<8; ++row){
+            hello_pattern[ci*8 + row] = g[row];
+        }
+    }
+}
+
+static std::vector<uint32_t> makeHelloImage(){
+    static bool inited=false; if(!inited){ initHelloPattern(); inited=true; }
+    std::vector<uint32_t> img(HELLO_W*HELLO_H, 0x00000000);
+    for(uint32_t ci=0; ci<11; ++ci){
+        for(uint32_t row=0; row<HELLO_H; ++row){
+            uint8_t bits = hello_pattern[ci*8 + row];
+            for(uint32_t col=0; col<5; ++col){
+                if(bits & (1 << (4-col))){
+                    uint32_t x = ci*6 + col; // 1 px spacing
+                    img[row*HELLO_W + x] = 0xFFFFFFFF; // white RGBA
+                }
+            }
+        }
+    }
+    return img;
+}
+
+// We hook QueuePresentKHR to inject a copy operation. For simplicity assume the swapchain image is already in GENERAL or we ignore layout (unsafe but minimal). Real code would query and transition layouts.
+
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkInstance* pInstance) {
+    // Walk pNext chain to get link info
+    const VkLayerInstanceCreateInfo* chainInfo = reinterpret_cast<const VkLayerInstanceCreateInfo*>(pCreateInfo->pNext);
+    while(chainInfo && chainInfo->sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO) {
+        if(chainInfo->function == VK_LAYER_LINK_INFO) {
+            g_nextGetInstanceProcAddr = chainInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+            // Advance the link so next layers see their proper link info
+            const_cast<VkLayerInstanceCreateInfo*>(chainInfo)->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
+            break;
+        }
+        chainInfo = reinterpret_cast<const VkLayerInstanceCreateInfo*>(chainInfo->pNext);
+    }
+    if(!g_nextGetInstanceProcAddr) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateInstance fpCreate = (PFN_vkCreateInstance) g_nextGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
+    if(!fpCreate) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = fpCreate(pCreateInfo, pAllocator, pInstance);
+    if(r != VK_SUCCESS) return r;
+    log_debug("vkCreateInstance chain ok");
+
+    InstanceDispatchTable table{};
+    table.GetInstanceProcAddr = g_nextGetInstanceProcAddr;
+    table.CreateInstance = fpCreate;
+    table.DestroyInstance = (PFN_vkDestroyInstance) g_nextGetInstanceProcAddr(*pInstance, "vkDestroyInstance");
+    table.CreateDevice = (PFN_vkCreateDevice) g_nextGetInstanceProcAddr(*pInstance, "vkCreateDevice");
+    table.EnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices) g_nextGetInstanceProcAddr(*pInstance, "vkEnumeratePhysicalDevices");
+    table.GetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties) g_nextGetInstanceProcAddr(*pInstance, "vkGetPhysicalDeviceProperties");
+    table.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties) g_nextGetInstanceProcAddr(*pInstance, "vkGetPhysicalDeviceMemoryProperties");
+    table.GetDeviceProcAddr = nullptr; // resolved per-device
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_instance_dispatch[*pInstance] = table;
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_instance_dispatch.find(instance);
+    if (it != g_instance_dispatch.end()) {
+        auto fp = it->second.DestroyInstance;
+        g_instance_dispatch.erase(it);
+        fp(instance, pAllocator);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice) {
+    // Extract link info from pNext
+    const VkLayerDeviceCreateInfo* chainInfo = reinterpret_cast<const VkLayerDeviceCreateInfo*>(pCreateInfo->pNext);
+    while(chainInfo && chainInfo->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO) {
+        if(chainInfo->function == VK_LAYER_LINK_INFO){
+            g_nextGetDeviceProcAddr = chainInfo->u.pLayerInfo->pfnNextGetDeviceProcAddr;
+            const_cast<VkLayerDeviceCreateInfo*>(chainInfo)->u.pLayerInfo = chainInfo->u.pLayerInfo->pNext;
+            break;
+        }
+        chainInfo = reinterpret_cast<const VkLayerDeviceCreateInfo*>(chainInfo->pNext);
+    }
+    if(!g_nextGetDeviceProcAddr || !g_nextGetInstanceProcAddr) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateDevice fp = (PFN_vkCreateDevice) g_nextGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateDevice");
+    if(!fp) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = fp(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    if (r != VK_SUCCESS) return r;
+
+    DeviceDispatchTable d{};
+    d.GetDeviceProcAddr = g_nextGetDeviceProcAddr;
+    d.DestroyDevice = (PFN_vkDestroyDevice) d.GetDeviceProcAddr(*pDevice, "vkDestroyDevice");
+    d.GetDeviceQueue = (PFN_vkGetDeviceQueue) d.GetDeviceProcAddr(*pDevice, "vkGetDeviceQueue");
+    d.QueuePresentKHR = (PFN_vkQueuePresentKHR) d.GetDeviceProcAddr(*pDevice, "vkQueuePresentKHR");
+    d.QueueSubmit = (PFN_vkQueueSubmit) d.GetDeviceProcAddr(*pDevice, "vkQueueSubmit");
+    d.AllocateCommandBuffers = (PFN_vkAllocateCommandBuffers) d.GetDeviceProcAddr(*pDevice, "vkAllocateCommandBuffers");
+    d.FreeCommandBuffers = (PFN_vkFreeCommandBuffers) d.GetDeviceProcAddr(*pDevice, "vkFreeCommandBuffers");
+    d.BeginCommandBuffer = (PFN_vkBeginCommandBuffer) d.GetDeviceProcAddr(*pDevice, "vkBeginCommandBuffer");
+    d.EndCommandBuffer = (PFN_vkEndCommandBuffer) d.GetDeviceProcAddr(*pDevice, "vkEndCommandBuffer");
+    d.ResetCommandBuffer = (PFN_vkResetCommandBuffer) d.GetDeviceProcAddr(*pDevice, "vkResetCommandBuffer");
+    d.CreateFence = (PFN_vkCreateFence) d.GetDeviceProcAddr(*pDevice, "vkCreateFence");
+    d.WaitForFences = (PFN_vkWaitForFences) d.GetDeviceProcAddr(*pDevice, "vkWaitForFences");
+    d.DestroyFence = (PFN_vkDestroyFence) d.GetDeviceProcAddr(*pDevice, "vkDestroyFence");
+    d.CreateBuffer = (PFN_vkCreateBuffer) d.GetDeviceProcAddr(*pDevice, "vkCreateBuffer");
+    d.GetBufferMemoryRequirements = (PFN_vkGetBufferMemoryRequirements) d.GetDeviceProcAddr(*pDevice, "vkGetBufferMemoryRequirements");
+    d.AllocateMemory = (PFN_vkAllocateMemory) d.GetDeviceProcAddr(*pDevice, "vkAllocateMemory");
+    d.BindBufferMemory = (PFN_vkBindBufferMemory) d.GetDeviceProcAddr(*pDevice, "vkBindBufferMemory");
+    d.CreateCommandPool = (PFN_vkCreateCommandPool) d.GetDeviceProcAddr(*pDevice, "vkCreateCommandPool");
+    d.DestroyCommandPool = (PFN_vkDestroyCommandPool) d.GetDeviceProcAddr(*pDevice, "vkDestroyCommandPool");
+    d.CmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage) d.GetDeviceProcAddr(*pDevice, "vkCmdCopyBufferToImage");
+    d.CreateImage = (PFN_vkCreateImage) d.GetDeviceProcAddr(*pDevice, "vkCreateImage");
+    d.GetImageMemoryRequirements = (PFN_vkGetImageMemoryRequirements) d.GetDeviceProcAddr(*pDevice, "vkGetImageMemoryRequirements");
+    d.BindImageMemory = (PFN_vkBindImageMemory) d.GetDeviceProcAddr(*pDevice, "vkBindImageMemory");
+    d.MapMemory = (PFN_vkMapMemory) d.GetDeviceProcAddr(*pDevice, "vkMapMemory");
+    d.UnmapMemory = (PFN_vkUnmapMemory) d.GetDeviceProcAddr(*pDevice, "vkUnmapMemory");
+    d.DestroyImage = (PFN_vkDestroyImage) d.GetDeviceProcAddr(*pDevice, "vkDestroyImage");
+    d.DestroyBuffer = (PFN_vkDestroyBuffer) d.GetDeviceProcAddr(*pDevice, "vkDestroyBuffer");
+    d.CreateSwapchainKHR = (PFN_vkCreateSwapchainKHR) d.GetDeviceProcAddr(*pDevice, "vkCreateSwapchainKHR");
+    d.DestroySwapchainKHR = (PFN_vkDestroySwapchainKHR) d.GetDeviceProcAddr(*pDevice, "vkDestroySwapchainKHR");
+    d.GetSwapchainImagesKHR = (PFN_vkGetSwapchainImagesKHR) d.GetDeviceProcAddr(*pDevice, "vkGetSwapchainImagesKHR");
+    d.physicalDevice = physicalDevice;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_device_dispatch[*pDevice] = d;
+    log_debug("vkCreateDevice intercepted");
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_device_dispatch.find(device);
+    if (it != g_device_dispatch.end()) {
+        auto fp = it->second.DestroyDevice;
+        g_device_dispatch.erase(it);
+        fp(device, pAllocator);
+    }
+}
+
+// Utility: find memory type index
+static uint32_t findMemoryType(const InstanceDispatchTable& inst, VkPhysicalDevice phys, uint32_t typeBits, VkMemoryPropertyFlags wanted){
+    VkPhysicalDeviceMemoryProperties mem{};
+    inst.GetPhysicalDeviceMemoryProperties(phys, &mem);
+    for(uint32_t i=0;i<mem.memoryTypeCount;++i){
+        if((typeBits & (1u<<i)) && (mem.memoryTypes[i].propertyFlags & wanted) == wanted) return i;
+    }
+    return 0; // fallback
+}
+
+// Present hook adds copy of phrase into each swapchain image about to be presented.
+VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
+    // Regular pass-through if disabled
+    VkDevice device = VK_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto qit = g_queue_to_device.find(queue);
+        if(qit != g_queue_to_device.end()) device = qit->second; else if(!g_device_dispatch.empty()) device = g_device_dispatch.begin()->first;
+    }
+    if(device==VK_NULL_HANDLE){
+        // Fallback just call first dispatch if any
+        for (auto &kv : g_device_dispatch) return kv.second.QueuePresentKHR(queue, pPresentInfo);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    DeviceDispatchTable* ddt=nullptr; InstanceDispatchTable* idt=nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        ddt = &g_device_dispatch[device];
+        if(!g_instance_dispatch.empty()) idt = &g_instance_dispatch.begin()->second;
+    }
+    if(!ddt || !idt || !ddt->QueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
+
+    if(!g_enabled) return ddt->QueuePresentKHR(queue, pPresentInfo);
+    log_debug("vkQueuePresentKHR overlay path");
+
+    // Build list of lit pixel positions for phrase (scaled) so we don't overwrite background.
+    static const char* text = "HELLO WORLD"; // 11 chars incl space
+    const uint32_t CHAR_W = 6; // 5 bits + 1 spacing
+    const uint32_t GLYPH_W_BITS = 5;
+    const uint32_t GLYPH_H = HELLO_H; // 8
+    const uint32_t SCALE = 4; // enlarge for visibility
+    const int32_t MARGIN_X = 8;
+    const int32_t MARGIN_Y = 8;
+    // Recreate hello_pattern if needed (makeHelloImage ensures it)
+    makeHelloImage(); // ensures pattern init side-effect
+    struct Px { uint16_t x,y; };
+    std::vector<Px> lit;
+    lit.reserve(500);
+    for(uint32_t ci=0; ci<11; ++ci){
+        char c = text[ci];
+        if(c==' ' ) continue;
+        for(uint32_t row=0; row<GLYPH_H; ++row){
+            uint8_t bits = hello_pattern[ci*8 + row];
+            for(uint32_t col=0; col<GLYPH_W_BITS; ++col){
+                if(bits & (1 << (4-col))){
+                    for(uint32_t sy=0; sy<SCALE; ++sy){
+                        for(uint32_t sx=0; sx<SCALE; ++sx){
+                            Px p{ (uint16_t)(ci*CHAR_W*SCALE + col*SCALE + sx), (uint16_t)(row*SCALE + sy) };
+                            lit.push_back(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if(lit.empty()) return ddt->QueuePresentKHR(queue, pPresentInfo);
+    VkDeviceSize bufSize = lit.size()*sizeof(uint32_t);
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bufSize; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer stagingBuf{}; if(ddt->CreateBuffer(device, &bci, nullptr, &stagingBuf) != VK_SUCCESS) return ddt->QueuePresentKHR(queue, pPresentInfo);
+    VkMemoryRequirements memReq{}; ddt->GetBufferMemoryRequirements(device, stagingBuf, &memReq);
+    uint32_t typeIndex = findMemoryType(*idt, ddt->physicalDevice, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = memReq.size; mai.memoryTypeIndex = typeIndex;
+    VkDeviceMemory stagingMem{}; if(ddt->AllocateMemory(device, &mai, nullptr, &stagingMem)!=VK_SUCCESS){ ddt->DestroyBuffer(device, stagingBuf, nullptr); return ddt->QueuePresentKHR(queue, pPresentInfo);}    
+    ddt->BindBufferMemory(device, stagingBuf, stagingMem, 0);
+    void* mapped=nullptr; if(ddt->MapMemory(device, stagingMem, 0, bufSize, 0, &mapped)==VK_SUCCESS){
+        uint32_t* dst = reinterpret_cast<uint32_t*>(mapped);
+        for(size_t i=0;i<lit.size();++i) dst[i] = 0xFFFFFFFF; // solid white pixels
+        ddt->UnmapMemory(device, stagingMem);
+    }
+
+    // Command pool per queue family (allocate transient each frame for minimalism)
+    uint32_t qFam = 0; {
+        std::lock_guard<std::mutex> lock(g_mutex); auto qfit = g_queue_family_index.find(queue); if(qfit!=g_queue_family_index.end()) qFam = qfit->second; }
+    VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpci.queueFamilyIndex = qFam; cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    VkCommandPool cpool{}; if(ddt->CreateCommandPool(device, &cpci, nullptr, &cpool)!=VK_SUCCESS){ ddt->DestroyBuffer(device, stagingBuf, nullptr); ddt->FreeCommandBuffers(device, cpool, 0, nullptr); return ddt->QueuePresentKHR(queue, pPresentInfo);}    
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; cbai.commandPool = cpool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd{}; if(ddt->AllocateCommandBuffers(device, &cbai, &cmd)!=VK_SUCCESS){ ddt->DestroyCommandPool(device, cpool, nullptr); ddt->DestroyBuffer(device, stagingBuf, nullptr); return ddt->QueuePresentKHR(queue, pPresentInfo);}    
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; ddt->BeginCommandBuffer(cmd, &cbbi);
+
+    // For each swapchain/image in present
+    for(uint32_t i=0;i<pPresentInfo->swapchainCount;++i){
+        VkSwapchainKHR sw = pPresentInfo->pSwapchains[i];
+        uint32_t imgIndex = pPresentInfo->pImageIndices[i];
+        SwapchainInfo sci{}; bool have=false; {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto sit = g_swapchains.find(sw); if(sit!=g_swapchains.end()){ sci = sit->second; have=true; }
+        }
+        if(!have || imgIndex >= sci.images.size()) continue;
+        VkImage img = sci.images[imgIndex];
+        // For each lit pixel create copy region
+        std::vector<VkBufferImageCopy> copies; copies.reserve(lit.size());
+        for(size_t pi=0; pi<lit.size(); ++pi){
+            VkBufferImageCopy c{};
+            c.bufferOffset = pi*sizeof(uint32_t);
+            c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            c.imageSubresource.mipLevel = 0;
+            c.imageSubresource.baseArrayLayer = 0;
+            c.imageSubresource.layerCount = 1;
+            c.imageOffset = { (int32_t)(MARGIN_X + lit[pi].x), (int32_t)(MARGIN_Y + lit[pi].y), 0};
+            c.imageExtent = {1,1,1};
+            copies.push_back(c);
+        }
+        if(!copies.empty()) ddt->CmdCopyBufferToImage(cmd, stagingBuf, img, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, (uint32_t)copies.size(), copies.data());
+    }
+    ddt->EndCommandBuffer(cmd);
+
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence{}; ddt->CreateFence(device, &fci, nullptr, &fence);
+    ddt->QueueSubmit(queue, 1, &si, fence);
+    ddt->WaitForFences(device, 1, &fence, VK_TRUE, 1'000'000'000ULL);
+    ddt->DestroyFence(device, fence, nullptr);
+    ddt->FreeCommandBuffers(device, cpool, 1, &cmd);
+    ddt->DestroyCommandPool(device, cpool, nullptr);
+    ddt->DestroyBuffer(device, stagingBuf, nullptr);
+    ddt->FreeCommandBuffers(device, cpool, 0, nullptr); // no-op
+    // Not freeing memory? Free: (lack of DestroyMemory – we only allocated via AllocateMemory)
+    // Vulkan has vkFreeMemory; obtain pointer
+    auto pfnFreeMemory = (PFN_vkFreeMemory) ddt->GetDeviceProcAddr(device, "vkFreeMemory");
+    if(pfnFreeMemory) pfnFreeMemory(device, stagingMem, nullptr);
+
+    return ddt->QueuePresentKHR(queue, pPresentInfo);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue* pQueue){
+    DeviceDispatchTable* ddt=nullptr; {
+        std::lock_guard<std::mutex> lock(g_mutex); auto it = g_device_dispatch.find(device); if(it!=g_device_dispatch.end()) ddt = &it->second; }
+    if(ddt && ddt->GetDeviceQueue){ ddt->GetDeviceQueue(device, queueFamilyIndex, queueIndex, pQueue); }
+    if(pQueue && *pQueue){ std::lock_guard<std::mutex> lock(g_mutex); g_queue_to_device[*pQueue]=device; g_queue_family_index[*pQueue]=queueFamilyIndex; }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain){
+    DeviceDispatchTable* ddt=nullptr; { std::lock_guard<std::mutex> lock(g_mutex); auto it=g_device_dispatch.find(device); if(it!=g_device_dispatch.end()) ddt=&it->second; }
+    if(!ddt||!ddt->CreateSwapchainKHR) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = ddt->CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    if(r==VK_SUCCESS){ std::lock_guard<std::mutex> lock(g_mutex); g_swapchains[*pSwapchain] = {device, pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height, {}}; }
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator){
+    DeviceDispatchTable* ddt=nullptr; { std::lock_guard<std::mutex> lock(g_mutex); auto it=g_device_dispatch.find(device); if(it!=g_device_dispatch.end()) ddt=&it->second; g_swapchains.erase(swapchain);}    
+    if(ddt && ddt->DestroySwapchainKHR) ddt->DestroySwapchainKHR(device, swapchain, pAllocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain, uint32_t* pCount, VkImage* pImages){
+    DeviceDispatchTable* ddt=nullptr; { std::lock_guard<std::mutex> lock(g_mutex); auto it=g_device_dispatch.find(device); if(it!=g_device_dispatch.end()) ddt=&it->second; }
+    if(!ddt||!ddt->GetSwapchainImagesKHR) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = ddt->GetSwapchainImagesKHR(device, swapchain, pCount, pImages);
+    if(r==VK_SUCCESS && pImages){ std::lock_guard<std::mutex> lock(g_mutex); auto &info = g_swapchains[swapchain]; info.images.assign(pImages, pImages + *pCount); }
+    return r;
+}
+
+// Exported layer negotiation functions
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* pName) {
+    if (std::strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkVoidFunction) vkQueuePresentKHR;
+    if (std::strcmp(pName, "vkGetDeviceQueue") == 0) return (PFN_vkVoidFunction) vkGetDeviceQueue;
+    if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0) return (PFN_vkVoidFunction) vkCreateSwapchainKHR;
+    if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) return (PFN_vkVoidFunction) vkDestroySwapchainKHR;
+    if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) return (PFN_vkVoidFunction) vkGetSwapchainImagesKHR;
+    auto it = g_device_dispatch.find(device);
+    if (it != g_device_dispatch.end() && it->second.GetDeviceProcAddr)
+        return it->second.GetDeviceProcAddr(device, pName);
+    if(g_nextGetDeviceProcAddr) return g_nextGetDeviceProcAddr(device, pName);
+    return nullptr;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* pName) {
+    if (std::strcmp(pName, "vkGetInstanceProcAddr") == 0) return (PFN_vkVoidFunction) vkGetInstanceProcAddr;
+    if (std::strcmp(pName, "vkCreateInstance") == 0) return (PFN_vkVoidFunction) vkCreateInstance;
+    if (std::strcmp(pName, "vkCreateDevice") == 0) return (PFN_vkVoidFunction) vkCreateDevice;
+    if (std::strcmp(pName, "vkQueuePresentKHR") == 0) return (PFN_vkVoidFunction) vkQueuePresentKHR;
+    if (std::strcmp(pName, "vkGetDeviceQueue") == 0) return (PFN_vkVoidFunction) vkGetDeviceQueue;
+    if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0) return (PFN_vkVoidFunction) vkCreateSwapchainKHR;
+    if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) return (PFN_vkVoidFunction) vkDestroySwapchainKHR;
+    if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) return (PFN_vkVoidFunction) vkGetSwapchainImagesKHR;
+    if(g_nextGetInstanceProcAddr) return g_nextGetInstanceProcAddr(instance, pName);
+    return nullptr;
+}
+
+// Layer properties
+static const VkLayerProperties layerProps = {
+    "VK_LAYER_LUNARG_test_vk", // layerName
+    VK_MAKE_VERSION(1, 0, 0),   // specVersion
+    VK_MAKE_VERSION(0, 1, 0),   // implementationVersion
+    "Test VK Hello overlay layer" // description
+};
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceLayerProperties(uint32_t* pPropertyCount, VkLayerProperties* pProperties) {
+    if (pProperties == nullptr) {
+        *pPropertyCount = 1;
+        return VK_SUCCESS;
+    }
+    if (*pPropertyCount >= 1) {
+        pProperties[0] = layerProps;
+        *pPropertyCount = 1;
+        return VK_SUCCESS;
+    }
+    return VK_INCOMPLETE;
+}
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(VkPhysicalDevice, uint32_t* pPropertyCount, VkLayerProperties* pProperties) {
+    return vkEnumerateInstanceLayerProperties(pPropertyCount, pProperties);
+}
+
+// Loader negotiation function (outside any other function scope)
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pVersionStruct){
+    if(!pVersionStruct) return VK_ERROR_INITIALIZATION_FAILED;
+    if(pVersionStruct->loaderLayerInterfaceVersion > 2) pVersionStruct->loaderLayerInterfaceVersion = 2;
+    // We set our entry points; loader provides no next pointers here— they come via link info in create chains.
+    pVersionStruct->pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    pVersionStruct->pfnGetDeviceProcAddr = vkGetDeviceProcAddr;
+    pVersionStruct->pfnGetPhysicalDeviceProcAddr = nullptr;
+    return VK_SUCCESS;
+}
