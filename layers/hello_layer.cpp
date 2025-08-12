@@ -8,6 +8,22 @@
 #include <unordered_map>
 #include <cstdio>
 #include <array>
+#include <cstdint>
+
+// FidelityFX Optical Flow headers (SDK submodule)
+#include <FidelityFX/host/ffx_opticalflow.h>
+#include <FidelityFX/host/backends/vk/ffx_vk.h>
+
+struct OpticalFlowIntegration {
+    FfxOpticalflowContext context{};
+    bool contextCreated = false;
+    bool pendingReset = true;
+    VkExtent2D extent{0,0};
+    std::vector<uint8_t> scratch; // backend scratch memory
+    FfxInterface backendInterface{};
+    FfxDevice ffxDevice{};
+};
+static OpticalFlowIntegration g_of; // single-device assumption for this minimal layer
 
 // Simple implicit layer that overlays "Hello world" in the top-left (or right by adjusting coordinates)
 // of any swapchain image by drawing a tiny CPU-side RGBA8 bitmap copied via vkCmdCopyBufferToImage
@@ -15,6 +31,7 @@
 
 // Environment toggle: test_vk=1 enables overlay
 static bool g_enabled = [](){ const char* v = std::getenv("test_vk"); return v && std::strcmp(v, "0") != 0; }();
+static bool g_of_enabled = [](){ const char* v = std::getenv("TEST_VK_OF"); return v && std::strcmp(v, "0") != 0; }();
 static void log_debug(const char* msg){ if(g_enabled) std::fprintf(stderr, "[test_vk] %s\n", msg); }
 
 // Next layer function pointers (global simple approach)
@@ -231,10 +248,26 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, c
     std::lock_guard<std::mutex> lock(g_mutex);
     g_device_dispatch[*pDevice] = d;
     log_debug("vkCreateDevice intercepted");
+    if(g_of_enabled){
+        size_t scratchSize = ffxGetScratchMemorySizeVK(physicalDevice, FFX_OPTICALFLOW_CONTEXT_COUNT);
+        g_of.scratch.resize(scratchSize);
+        VkDeviceContext devCtx{ *pDevice, physicalDevice, g_nextGetDeviceProcAddr };
+        g_of.ffxDevice = ffxGetDeviceVK(&devCtx);
+        if(ffxGetInterfaceVK(&g_of.backendInterface, g_of.ffxDevice, g_of.scratch.data(), g_of.scratch.size(), FFX_OPTICALFLOW_CONTEXT_COUNT)==FFX_OK){
+            log_debug("FFX backend interface OK");
+        } else {
+            log_debug("FFX backend interface FAILED");
+            g_of_enabled=false;
+        }
+    }
     return r;
 }
 
 VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator) {
+    if(g_of.contextCreated){
+        ffxOpticalflowContextDestroy(&g_of.context);
+        g_of.contextCreated=false;
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_device_dispatch.find(device);
     if (it != g_device_dispatch.end()) {
@@ -277,8 +310,12 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentI
     }
     if(!ddt || !idt || !ddt->QueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
 
-    if(!g_enabled) return ddt->QueuePresentKHR(queue, pPresentInfo);
-    log_debug("vkQueuePresentKHR overlay path");
+    if(g_of_enabled && !g_of.contextCreated && g_of.backendInterface.fpGetSDKVersion){
+        FfxOpticalflowContextDescription desc{}; desc.backendInterface = g_of.backendInterface; desc.flags=0; desc.resolution.width = g_of.extent.width?g_of.extent.width:1024; desc.resolution.height = g_of.extent.height?g_of.extent.height:1024;
+        if(ffxOpticalflowContextCreate(&g_of.context, &desc)==FFX_OK){ g_of.contextCreated=true; g_of.pendingReset=true; log_debug("Optical Flow context created"); } else { log_debug("Optical Flow context create failed"); g_of_enabled=false; }
+    }
+    if(!g_enabled && !g_of_enabled) return ddt->QueuePresentKHR(queue, pPresentInfo);
+    if(g_enabled) log_debug("vkQueuePresentKHR overlay path");
 
     // Build list of lit pixel positions for phrase (scaled) so we don't overwrite background.
     static const char* text = "HELLO WORLD"; // 11 chars incl space
@@ -391,6 +428,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwa
     if(!ddt||!ddt->CreateSwapchainKHR) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = ddt->CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
     if(r==VK_SUCCESS){ std::lock_guard<std::mutex> lock(g_mutex); g_swapchains[*pSwapchain] = {device, pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height, {}}; }
+    if(r==VK_SUCCESS && g_of_enabled){
+        if(g_of.extent.width != pCreateInfo->imageExtent.width || g_of.extent.height != pCreateInfo->imageExtent.height){ g_of.pendingReset = true; }
+        g_of.extent = {pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height};
+    }
     return r;
 }
 

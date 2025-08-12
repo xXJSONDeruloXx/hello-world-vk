@@ -5,13 +5,32 @@
 ##   make clean
 
 CXX ?= g++
-CXXFLAGS ?= -O2 -g -fPIC -std=c++17 -Wall -Wextra -Wno-unused-parameter
-INCLUDES = -I/usr/include -I/usr/include/vulkan
+CXXFLAGS ?= -O2 -g -fPIC -std=c++17 -Wall -Wextra -Wno-unused-parameter -DFFX_OF -include layers/ffx_compat.h
+
+FFX_SDK_DIR := third_party/FidelityFX-SDK/sdk
+
+INCLUDES = -I/usr/include -I/usr/include/vulkan \
+	-I$(FFX_SDK_DIR)/include \
+	-I$(FFX_SDK_DIR)/src/backends/shared \
+	-I$(FFX_SDK_DIR)/src/shared
+
 LDFLAGS ?= -shared
 LDLIBS ?= -lvulkan
 
 LIB = libVK_LAYER_LUNARG_test_vk.so
-SRC = layers/hello_layer.cpp
+LAYER_SRC = layers/hello_layer.cpp
+
+# Minimal subset of FidelityFX SDK sources needed for Optical Flow (vk backend + shared + opticalflow component)
+FFX_SRC = \
+	$(FFX_SDK_DIR)/src/backends/vk/ffx_vk.cpp \
+	$(FFX_SDK_DIR)/src/backends/shared/ffx_shader_blobs.cpp \
+	$(FFX_SDK_DIR)/src/components/opticalflow/ffx_opticalflow.cpp \
+	$(FFX_SDK_DIR)/src/shared/ffx_assert.cpp \
+	$(FFX_SDK_DIR)/src/shared/ffx_object_management.cpp \
+	$(FFX_SDK_DIR)/src/shared/ffx_message.cpp \
+	$(FFX_SDK_DIR)/src/shared/ffx_breadcrumbs_list.cpp
+
+SRC = $(LAYER_SRC) $(FFX_SRC)
 
 all: $(LIB)
 

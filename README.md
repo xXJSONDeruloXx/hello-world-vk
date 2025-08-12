@@ -1,6 +1,11 @@
-# test_vk HELLO WORLD Vulkan Layer
+# test_vk Vulkan Layer (HELLO WORLD + FidelityFX Optical Flow bootstrap)
 
-Minimal explicit Vulkan layer that, when `test_vk=1` is set, overlays the phrase **HELLO WORLD** using a tiny built‑in bitmap font scaled up for visibility (drawn as per‑pixel copies) each frame.
+Minimal explicit Vulkan layer. Two optional features controlled by environment variables:
+
+1. `test_vk=1` overlays the phrase **HELLO WORLD** using a tiny built‑in bitmap font (implemented as lots of 1x1 buffer-to-image copies each frame — intentionally naive for educational clarity).
+2. `TEST_VK_OF=1` initializes an AMD FidelityFX Optical Flow context (via the bundled SDK) for the current swapchain resolution. At present this code only creates/destroys the Optical Flow context; it does NOT yet dispatch the Optical Flow passes nor visualize motion vectors. (Planned: replace the text overlay with summarized motion magnitude / vector field.)
+
+If both are set, you will see the existing HELLO WORLD overlay plus log messages indicating Optical Flow context creation.
 
 ## Build (Makefile fallback)
 
@@ -17,7 +22,7 @@ Artifacts after `make install`:
 - Library: `~/.local/lib/libVK_LAYER_LUNARG_test_vk.so`
 - Manifest (explicit layer): `~/.local/share/vulkan/explicit_layer.d/VK_LAYER_LUNARG_test_vk.json`
 
-## Run / Test
+## Run / Test (HELLO overlay)
 
 Enable the explicit layer via `VK_INSTANCE_LAYERS` and toggle overlay with `test_vk`:
 
@@ -44,6 +49,29 @@ You should see lines like:
 [test_vk] vkQueuePresentKHR overlay path
 ```
 
+## Optical Flow (early integration status)
+
+Environment toggle: set `TEST_VK_OF=1` alongside enabling the layer, e.g.:
+
+```bash
+VK_INSTANCE_LAYERS=VK_LAYER_LUNARG_test_vk TEST_VK_OF=1 test_vk=1 vkcube
+```
+
+What happens today:
+* Allocates backend scratch memory sized by `ffxGetScratchMemorySizeVK`.
+* Acquires a backend interface (`ffxGetInterfaceVK`).
+* Creates an `FfxOpticalflowContext` with swapchain dimensions (or 1024x1024 fallback until first swapchain is known).
+* Destroys the context on device destruction.
+
+What is NOT yet implemented (roadmap):
+* Wrapping swapchain images as `FfxResource` inputs and creating required output resources.
+* Calling `ffxOpticalflowContextDispatch` each frame.
+* Reading back / visualizing motion vectors (planned overlay: per‑pixel hue for direction + intensity or textual min/avg/max magnitude numbers in place of HELLO WORLD).
+
+Planned quick next step: introduce a simplified text renderer (instead of fixed HELLO WORLD bitmap) to print per‑frame Optical Flow stats once dispatch & readback are wired.
+
+If you need full Optical Flow visualization immediately, see Potential Next Improvements below and consider contributing a patch.
+
 ## Notes
 
 ## How it works (quick sketch)
@@ -65,6 +93,8 @@ You should see lines like:
 - Cache/reuse buffer & command pool.
 - Environment variables for position (e.g. TEST_VK_POS=top-right), scale, color.
 - Proper font rendering (stb_truetype) and UTF-8 text config.
+- Optical Flow dispatch & motion field overlay (replace or augment HELLO WORLD).
+- GPU-side vector-to-color compute shader instead of CPU pixel stamping.
 - Single copy of tightly-packed image instead of many 1x1 copies.
 
 Use only for experimentation / learning.
