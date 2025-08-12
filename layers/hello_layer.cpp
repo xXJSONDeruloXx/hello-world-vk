@@ -83,6 +83,7 @@ struct DeviceDispatchTable {
     PFN_vkDestroySwapchainKHR DestroySwapchainKHR;
     PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR;
     VkPhysicalDevice physicalDevice{};
+    VkInstance instance{}; // owning instance
 };
 
 static std::mutex g_mutex;
@@ -99,6 +100,64 @@ struct SwapchainInfo {
 static std::unordered_map<VkSwapchainKHR, SwapchainInfo> g_swapchains;
 
 static std::unordered_map<VkQueue, uint32_t> g_queue_family_index; // needed for command pool
+
+// Lazy Optical Flow backend initialization helper. We defer expensive / potentially unsafe
+// backend interface acquisition (which previously happened in vkCreateDevice and appeared to
+// trigger a crash inside ffxGetScratchMemorySizeVK) until after we know the application has
+// created a swapchain or is presenting – implying the device is fully usable and required
+// extensions/features are active.
+static void initOpticalFlowIfNeeded(DeviceDispatchTable* ddt, InstanceDispatchTable* idt) {
+    if(!g_of_enabled) return;
+    if(!ddt || !idt) return;
+    if(g_of.backendInterface.fpGetSDKVersion) return; // already initialized
+
+    std::fprintf(stderr, "[test_vk] OF lazy init: starting (dispatch=%p phys=%p inst=%p)\n", (void*)ddt, (void*)ddt->physicalDevice, (void*)ddt->instance);
+
+    // Validate physical device by enumerating (best effort; failure is non-fatal)
+    bool physValid = false;
+    if(idt->EnumeratePhysicalDevices){
+        uint32_t count=0; if(idt->EnumeratePhysicalDevices((VkInstance)g_instance_dispatch.begin()->first, &count, nullptr)==VK_SUCCESS && count>0){
+            std::vector<VkPhysicalDevice> phys(count);
+            if(idt->EnumeratePhysicalDevices((VkInstance)g_instance_dispatch.begin()->first, &count, phys.data())==VK_SUCCESS){
+                for(auto p: phys) if(p==ddt->physicalDevice) { physValid=true; break; }
+            }
+        }
+    }
+    if(!physValid){
+        std::fprintf(stderr, "[test_vk] OF lazy init: physical device validation skipped/failed (continuing)\n");
+    }
+
+    // Prevalidation: attempt enumerate device extensions directly to ensure physicalDevice is acceptable.
+    bool canEnum = false;
+    if(ddt->instance && g_nextGetInstanceProcAddr){
+        auto fpEnumDevExt = (PFN_vkEnumerateDeviceExtensionProperties) g_nextGetInstanceProcAddr(ddt->instance, "vkEnumerateDeviceExtensionProperties");
+        if(fpEnumDevExt){ uint32_t extCount=0; VkResult er = fpEnumDevExt(ddt->physicalDevice, nullptr, &extCount, nullptr); if(er==VK_SUCCESS){ canEnum=true; std::fprintf(stderr, "[test_vk] OF prevalidation: extension count=%u\n", extCount); } else { std::fprintf(stderr, "[test_vk] OF prevalidation: enumerate failed VkResult=%d\n", er);} }
+    }
+    if(!canEnum){ std::fprintf(stderr, "[test_vk] OF lazy init: prevalidation failed, disabling OF\n"); g_of_enabled=false; return; }
+    size_t scratchSize = 0;
+    std::fprintf(stderr, "[test_vk] OF lazy init: calling ffxGetScratchMemorySizeVK (after prevalidation)\n");
+    scratchSize = ffxGetScratchMemorySizeVK(ddt->physicalDevice, FFX_OPTICALFLOW_CONTEXT_COUNT);
+    std::fprintf(stderr, "[test_vk] OF lazy init: scratch size = %zu\n", scratchSize);
+    try { g_of.scratch.resize(scratchSize); } catch(...) { std::fprintf(stderr, "[test_vk] OF lazy init: scratch resize threw\n"); }
+
+    // Build the device context from the dispatch table and associated VkDevice (found by reverse lookup).
+    VkDevice foundDevice = VK_NULL_HANDLE; for(auto &kv : g_device_dispatch){ if(&kv.second == ddt){ foundDevice = kv.first; break; } }
+    if(foundDevice == VK_NULL_HANDLE){ std::fprintf(stderr, "[test_vk] OF lazy init: no device handle found\n"); g_of_enabled=false; return; }
+    VkDeviceContext devCtx{ foundDevice, ddt->physicalDevice, ddt->GetDeviceProcAddr };
+    std::fprintf(stderr, "[test_vk] OF lazy init: calling ffxGetDeviceVK (VkDevice=%p)\n", (void*)devCtx.vkDevice);
+    g_of.ffxDevice = ffxGetDeviceVK(&devCtx);
+    std::fprintf(stderr, "[test_vk] OF lazy init: got opaque ffxDevice=%p\n", (void*)g_of.ffxDevice);
+
+    FfxErrorCode ifaceResult = ffxGetInterfaceVK(&g_of.backendInterface, g_of.ffxDevice, g_of.scratch.data(), g_of.scratch.size(), FFX_OPTICALFLOW_CONTEXT_COUNT);
+    if(ifaceResult==FFX_OK){
+        // Ensure frame generation path is disabled (not implemented in this minimal build).
+        g_of.backendInterface.fpSwapChainConfigureFrameGeneration = nullptr;
+        log_debug("OF lazy init: backend interface OK");
+    } else {
+        log_debug("OF lazy init: backend interface FAILED – disabling OF");
+        g_of_enabled=false;
+    }
+}
 
 // Helpers removed (unused after proper chaining)
 
@@ -245,6 +304,17 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, c
     d.DestroySwapchainKHR = (PFN_vkDestroySwapchainKHR) d.GetDeviceProcAddr(*pDevice, "vkDestroySwapchainKHR");
     d.GetSwapchainImagesKHR = (PFN_vkGetSwapchainImagesKHR) d.GetDeviceProcAddr(*pDevice, "vkGetSwapchainImagesKHR");
     d.physicalDevice = physicalDevice;
+    // Determine owning instance by scanning known instances
+    for(auto &instPair : g_instance_dispatch){
+        auto &instTable = instPair.second;
+        if(!instTable.EnumeratePhysicalDevices) continue;
+        uint32_t count=0;
+        if(instTable.EnumeratePhysicalDevices(instPair.first, &count, nullptr)!=VK_SUCCESS || count==0) continue;
+        std::vector<VkPhysicalDevice> phys(count);
+        if(instTable.EnumeratePhysicalDevices(instPair.first, &count, phys.data())!=VK_SUCCESS) continue;
+        for(auto p: phys){ if(p==physicalDevice){ d.instance = instPair.first; break; } }
+        if(d.instance) break;
+    }
 
     std::lock_guard<std::mutex> lock(g_mutex);
     g_device_dispatch[*pDevice] = d;
@@ -253,26 +323,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, c
         std::fprintf(stderr, "[test_vk] flags: overlay=%d opticalflow=%d\n", (int)g_enabled, (int)g_of_enabled);
     }
     if(g_of_enabled){
-        std::fprintf(stderr, "[test_vk] OF init: entering init block\n");
-        size_t scratchSize = 0;
-        std::fprintf(stderr, "[test_vk] OF init: calling ffxGetScratchMemorySizeVK\n");
-        scratchSize = ffxGetScratchMemorySizeVK(physicalDevice, FFX_OPTICALFLOW_CONTEXT_COUNT);
-        std::fprintf(stderr, "[test_vk] OF init: scratch size = %zu\n", scratchSize);
-        try { g_of.scratch.resize(scratchSize); } catch(...) { std::fprintf(stderr, "[test_vk] OF init: scratch resize threw\n"); }
-        std::fprintf(stderr, "[test_vk] OF init: creating device context struct\n");
-        VkDeviceContext devCtx{ *pDevice, physicalDevice, g_nextGetDeviceProcAddr };
-        std::fprintf(stderr, "[test_vk] OF init: calling ffxGetDeviceVK\n");
-        g_of.ffxDevice = ffxGetDeviceVK(&devCtx);
-    std::fprintf(stderr, "[test_vk] OF init: got ffxDevice handle (opaque ptr=%p) calling ffxGetInterfaceVK\n", (void*)g_of.ffxDevice);
-        FfxErrorCode ifaceResult = ffxGetInterfaceVK(&g_of.backendInterface, g_of.ffxDevice, g_of.scratch.data(), g_of.scratch.size(), FFX_OPTICALFLOW_CONTEXT_COUNT);
-        if(ifaceResult==FFX_OK){
-            // We don't ship frame generation subsystem; ensure pointer is null to avoid accidental calls.
-            g_of.backendInterface.fpSwapChainConfigureFrameGeneration = nullptr;
-            log_debug("FFX backend interface OK");
-        } else {
-            log_debug("FFX backend interface FAILED");
-            g_of_enabled=false;
-        }
+    std::fprintf(stderr, "[test_vk] OF init: deferring backend initialization to lazy path\n");
     }
     return r;
 }
@@ -330,6 +381,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentI
         std::fprintf(stderr, "[test_vk] Present state: overlay=%d of_enabled=%d of_ctx=%d backend=%p extent=%ux%u\n",
             (int)g_enabled, (int)g_of_enabled, (int)g_of.contextCreated, (void*)g_of.backendInterface.fpGetSDKVersion,
             g_of.extent.width, g_of.extent.height);
+    }
+    // Attempt lazy backend initialization before any context creation attempt.
+    if(g_of_enabled && !g_of.backendInterface.fpGetSDKVersion){
+        initOpticalFlowIfNeeded(ddt, idt);
     }
     if(g_of_enabled && !g_of.contextCreated){
         if(!g_of.backendInterface.fpGetSDKVersion){
