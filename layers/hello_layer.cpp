@@ -14,6 +14,7 @@
 // FidelityFX Optical Flow headers (SDK submodule)
 #include <FidelityFX/host/ffx_opticalflow.h>
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
+#include <FidelityFX/host/ffx_interface.h>
 
 struct OpticalFlowIntegration {
     FfxOpticalflowContext context{};
@@ -23,6 +24,13 @@ struct OpticalFlowIntegration {
     std::vector<uint8_t> scratch; // backend scratch memory
     FfxInterface backendInterface{};
     FfxDevice ffxDevice{};
+    // Shared resources for optical flow outputs (vector + SCD) created via backend interface
+    bool resourcesReady = false;
+    uint32_t sharedEffectContextId = 0; // backend context id for shared resources
+    FfxResource opticalFlowVectorRes{}; // wrapped resource handle supplied to dispatch
+    FfxResource opticalFlowSCDRes{};
+    FfxResourceInternal opticalFlowVectorInternal{}; // backend internal ids (for map/unmap)
+    FfxResourceInternal opticalFlowSCDInternal{};
 };
 static OpticalFlowIntegration g_of; // single-device assumption for this minimal layer
 
@@ -51,6 +59,7 @@ struct InstanceDispatchTable {
     PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
     PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
+    PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties; // newly tracked
 };
 
 struct DeviceDispatchTable {
@@ -102,31 +111,6 @@ struct SwapchainInfo {
 static std::unordered_map<VkSwapchainKHR, SwapchainInfo> g_swapchains;
 
 static std::unordered_map<VkQueue, uint32_t> g_queue_family_index; // needed for command pool
-
-// Override placed after dispatch table declarations for full type visibility.
-extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
-    VkPhysicalDevice physicalDevice,
-    const char* pLayerName,
-    uint32_t* pPropertyCount,
-    VkExtensionProperties* pProperties) {
-    PFN_vkEnumerateDeviceExtensionProperties realFn = nullptr;
-    VkInstance owningInst = VK_NULL_HANDLE;
-    for(auto &kv : g_device_dispatch){ if(kv.second.physicalDevice == physicalDevice){ owningInst = kv.second.instance; break; } }
-    if(owningInst && g_nextGetInstanceProcAddr){
-        realFn = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(g_nextGetInstanceProcAddr(owningInst, "vkEnumerateDeviceExtensionProperties"));
-    }
-    if(!realFn && g_nextGetInstanceProcAddr){
-        realFn = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(g_nextGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateDeviceExtensionProperties"));
-    }
-    if(!realFn){
-        void* lib = dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_NOLOAD);
-        if(lib){ realFn = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(dlsym(lib, "vkEnumerateDeviceExtensionProperties")); }
-    }
-    if(!realFn){ if(pPropertyCount) *pPropertyCount = 0; std::fprintf(stderr, "[test_vk] enumerate override: resolve fail phys=%p\n", (void*)physicalDevice); return VK_ERROR_INITIALIZATION_FAILED; }
-    VkResult r = realFn(physicalDevice, pLayerName, pPropertyCount, pProperties);
-    if(pProperties==nullptr){ std::fprintf(stderr, "[test_vk] enumerate override: phys=%p inst=%p count=%u res=%d fn=%p\n", (void*)physicalDevice, (void*)owningInst, pPropertyCount?*pPropertyCount:0, r, (void*)realFn); }
-    return r;
-}
 
 extern "C" VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties(
     VkPhysicalDevice physicalDevice,
@@ -222,20 +206,16 @@ static void initOpticalFlowIfNeeded(DeviceDispatchTable* ddt, InstanceDispatchTa
         std::fprintf(stderr, "[test_vk] OF lazy init: physical device validation skipped/failed (continuing)\n");
     }
 
-    // Prevalidation: attempt enumerate device extensions directly to ensure physicalDevice is acceptable.
-    bool canEnum = false;
-    if(ddt->instance && g_nextGetInstanceProcAddr){
-        auto fpEnumDevExt = (PFN_vkEnumerateDeviceExtensionProperties) g_nextGetInstanceProcAddr(ddt->instance, "vkEnumerateDeviceExtensionProperties");
-        if(fpEnumDevExt){ uint32_t extCount=0; VkResult er = fpEnumDevExt(ddt->physicalDevice, nullptr, &extCount, nullptr); if(er==VK_SUCCESS){ canEnum=true; std::fprintf(stderr, "[test_vk] OF prevalidation: extension count=%u\n", extCount); } else { std::fprintf(stderr, "[test_vk] OF prevalidation: enumerate failed VkResult=%d\n", er);} }
-    }
-    if(!canEnum){ std::fprintf(stderr, "[test_vk] OF lazy init: prevalidation failed, disabling OF\n"); g_of_enabled=false; return; }
-        // Diagnostic: compare direct global call vs pointer path to detect discrepancy.
-        {
-            uint32_t extCountDirect=0; VkResult directRes = vkEnumerateDeviceExtensionProperties(ddt->physicalDevice, nullptr, &extCountDirect, nullptr);
-            std::fprintf(stderr, "[test_vk] OF diag: direct global vkEnumerateDeviceExtensionProperties res=%d count=%u (global fn=%p)\n", directRes, extCountDirect, (void*)vkEnumerateDeviceExtensionProperties);
+    // Light validation: ensure enumerate function resolves; non-fatal if missing.
+    if(ddt->instance){
+        auto instIt = g_instance_dispatch.find(ddt->instance);
+        if(instIt != g_instance_dispatch.end() && instIt->second.EnumerateDeviceExtensionProperties){
+            uint32_t extCount=0; instIt->second.EnumerateDeviceExtensionProperties(ddt->physicalDevice, nullptr, &extCount, nullptr);
+        } else if(g_nextGetInstanceProcAddr){
             auto fpEnumDevExt = (PFN_vkEnumerateDeviceExtensionProperties) g_nextGetInstanceProcAddr(ddt->instance, "vkEnumerateDeviceExtensionProperties");
-            if(fpEnumDevExt){ uint32_t extCountPtr=0; VkResult ptrRes = fpEnumDevExt(ddt->physicalDevice, nullptr, &extCountPtr, nullptr); std::fprintf(stderr, "[test_vk] OF diag: pointer enumerate res=%d count=%u (ptr fn=%p)\n", ptrRes, extCountPtr, (void*)fpEnumDevExt); }
+            if(fpEnumDevExt){ uint32_t extCount=0; fpEnumDevExt(ddt->physicalDevice, nullptr, &extCount, nullptr); }
         }
+    }
     // Build the device context from the dispatch table and associated VkDevice (found by reverse lookup).
     VkDevice foundDevice = VK_NULL_HANDLE; for(auto &kv : g_device_dispatch){ if(&kv.second == ddt){ foundDevice = kv.first; break; } }
     if(foundDevice == VK_NULL_HANDLE){ std::fprintf(stderr, "[test_vk] OF lazy init: no device handle found\n"); g_of_enabled=false; return; }
@@ -259,7 +239,68 @@ static void initOpticalFlowIfNeeded(DeviceDispatchTable* ddt, InstanceDispatchTa
     log_debug("OF lazy init: backend interface OK (adaptive scratch)");
 }
 
-// Helpers removed (unused after proper chaining)
+// Create optical flow context when extent known & backend interface ready.
+static void createOpticalFlowContextIfNeeded() {
+    if(!g_of_enabled) return;
+    if(g_of.contextCreated) return;
+    if(!g_of.backendInterface.fpGetSDKVersion) return; // backend not ready
+    if(g_of.extent.width == 0 || g_of.extent.height == 0) return; // need dimensions
+    FfxOpticalflowContextDescription desc{};
+    desc.backendInterface = g_of.backendInterface; // copy value
+    desc.flags = 0;
+    desc.resolution.width = g_of.extent.width;
+    desc.resolution.height = g_of.extent.height;
+    FfxErrorCode ec = ffxOpticalflowContextCreate(&g_of.context, &desc);
+    if(ec != FFX_OK){
+        std::fprintf(stderr, "[test_vk] OF: context create failed ec=%d (disabling)\n", ec);
+        g_of_enabled=false; return;
+    }
+    g_of.contextCreated = true;
+    std::fprintf(stderr, "[test_vk] OF: context created %ux%u\n", g_of.extent.width, g_of.extent.height);
+}
+
+static void createOpticalFlowSharedResourcesIfNeeded(){
+    if(!g_of_enabled) return;
+    if(!g_of.contextCreated) return;
+    if(g_of.resourcesReady) return;
+    if(!g_of.backendInterface.fpCreateBackendContext || !g_of.backendInterface.fpCreateResource || !g_of.backendInterface.fpGetResource){
+        std::fprintf(stderr, "[test_vk] OF: backend missing resource callbacks\n"); return; }
+    if(g_of.sharedEffectContextId==0){
+        FfxErrorCode ec = g_of.backendInterface.fpCreateBackendContext(&g_of.backendInterface, FFX_EFFECT_SHAREDRESOURCES, nullptr, &g_of.sharedEffectContextId);
+        if(ec != FFX_OK){ std::fprintf(stderr, "[test_vk] OF: create shared backend ctx failed ec=%d\n", ec); return; }
+    }
+    FfxOpticalflowSharedResourceDescriptions shared{};
+    if(ffxOpticalflowGetSharedResourceDescriptions(&g_of.context, &shared)!=FFX_OK){ std::fprintf(stderr, "[test_vk] OF: get shared desc failed\n"); return; }
+    FfxErrorCode e1 = g_of.backendInterface.fpCreateResource(&g_of.backendInterface, &shared.opticalFlowVector, g_of.sharedEffectContextId, &g_of.opticalFlowVectorInternal);
+    FfxErrorCode e2 = g_of.backendInterface.fpCreateResource(&g_of.backendInterface, &shared.opticalFlowSCD, g_of.sharedEffectContextId, &g_of.opticalFlowSCDInternal);
+    if(e1!=FFX_OK || e2!=FFX_OK){ std::fprintf(stderr, "[test_vk] OF: create shared resources failed (%d,%d)\n", e1, e2); return; }
+    g_of.opticalFlowVectorRes = g_of.backendInterface.fpGetResource(&g_of.backendInterface, g_of.opticalFlowVectorInternal);
+    g_of.opticalFlowSCDRes = g_of.backendInterface.fpGetResource(&g_of.backendInterface, g_of.opticalFlowSCDInternal);
+    g_of.resourcesReady = g_of.opticalFlowVectorRes.resource && g_of.opticalFlowSCDRes.resource;
+    std::fprintf(stderr, "[test_vk] OF: shared resources ready=%d vecIdx=%d scdIdx=%d\n", (int)g_of.resourcesReady, g_of.opticalFlowVectorInternal.internalIndex, g_of.opticalFlowSCDInternal.internalIndex);
+}
+
+static void dispatchOpticalFlowIfPossible(VkCommandBuffer cmd, VkImage swapImage){
+    if(!g_of_enabled) return;
+    if(!g_of.contextCreated || !g_of.resourcesReady) return;
+    FfxResourceDescription colorDesc{}; // minimal description for swapchain image
+    colorDesc.type = FFX_RESOURCE_TYPE_TEXTURE2D;
+    colorDesc.format = ffxGetSurfaceFormatVK(VK_FORMAT_B8G8R8A8_UNORM); // assumption; TODO detect actual
+    colorDesc.width = g_of.extent.width; colorDesc.height = g_of.extent.height; colorDesc.depth=1; colorDesc.mipCount=1; colorDesc.flags=FFX_RESOURCE_FLAGS_NONE; colorDesc.usage=FFX_RESOURCE_USAGE_READ_ONLY;
+    FfxResource colorRes = ffxGetResourceVK(reinterpret_cast<void*>(swapImage), colorDesc, L"SWAPCHAIN_COLOR", FFX_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    FfxOpticalflowDispatchDescription dis{}; dis.commandList = ffxGetCommandListVK(cmd); dis.color = colorRes; dis.opticalFlowVector = g_of.opticalFlowVectorRes; dis.opticalFlowSCD = g_of.opticalFlowSCDRes; dis.reset = g_of.pendingReset; dis.backbufferTransferFunction=0; dis.minMaxLuminance.x=0.f; dis.minMaxLuminance.y=1000.f;
+    FfxErrorCode ec = ffxOpticalflowContextDispatch(&g_of.context, &dis);
+    if(ec!=FFX_OK){ std::fprintf(stderr, "[test_vk] OF: dispatch failed ec=%d (disabling)\n", ec); g_of_enabled=false; return; }
+    g_of.pendingReset=false;
+    static uint32_t frameCounter=0; ++frameCounter;
+    if((frameCounter & 15u)==0){ // periodic scene change diagnostics
+        if(g_of.backendInterface.fpMapResource && g_of.backendInterface.fpUnmapResource){
+            void* data=nullptr; if(g_of.backendInterface.fpMapResource(&g_of.backendInterface, g_of.opticalFlowSCDInternal, &data)==FFX_OK && data){
+                uint32_t* u32 = (uint32_t*)data; std::fprintf(stderr, "[test_vk] OF: SCD raw first3=[%u %u %u] idx=%d\n", u32[0], u32[1], u32[2], g_of.opticalFlowSCDInternal.internalIndex); g_of.backendInterface.fpUnmapResource(&g_of.backendInterface, g_of.opticalFlowSCDInternal);
+            }
+        }
+    }
+}
 
 // Very small monochrome bitmap font for phrase "HELLO WORLD" (fixed phrase) 8 px tall.
 // Each character 6 px wide (5 + 1 space). 11 chars => 66px width.
@@ -339,6 +380,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo* pCre
     table.GetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties) g_nextGetInstanceProcAddr(*pInstance, "vkGetPhysicalDeviceProperties");
     table.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties) g_nextGetInstanceProcAddr(*pInstance, "vkGetPhysicalDeviceMemoryProperties");
     table.GetDeviceProcAddr = nullptr; // resolved per-device
+    table.EnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties) g_nextGetInstanceProcAddr(*pInstance, "vkEnumerateDeviceExtensionProperties");
 
     std::lock_guard<std::mutex> lock(g_mutex);
     g_instance_dispatch[*pInstance] = table;
@@ -486,12 +528,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentI
     if(g_of_enabled && !g_of.backendInterface.fpGetSDKVersion){
         initOpticalFlowIfNeeded(ddt, idt);
     }
-    if(g_of_enabled && !g_of.contextCreated){
-        if(!g_of.backendInterface.fpGetSDKVersion){
-            log_debug("Optical Flow: backend interface not initialized yet");
-        } else {
-            log_debug("Optical Flow: skipping context create (temporarily disabled for stability)");
-        }
+    if(g_of_enabled){
+        // After swapchain extent known (captured earlier) we can attempt context creation
+        createOpticalFlowContextIfNeeded();
+        createOpticalFlowSharedResourcesIfNeeded();
     }
     if(!g_enabled && !g_of_enabled) return ddt->QueuePresentKHR(queue, pPresentInfo);
     if(g_enabled) log_debug("vkQueuePresentKHR overlay path");
@@ -550,6 +590,15 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentI
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; cbai.commandPool = cpool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
     VkCommandBuffer cmd{}; if(ddt->AllocateCommandBuffers(device, &cbai, &cmd)!=VK_SUCCESS){ ddt->DestroyCommandPool(device, cpool, nullptr); ddt->DestroyBuffer(device, stagingBuf, nullptr); return ddt->QueuePresentKHR(queue, pPresentInfo);}    
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; ddt->BeginCommandBuffer(cmd, &cbbi);
+    // Dispatch optical flow once per present (first swapchain image) before overlay so overlay can later reflect stats.
+    if(g_of_enabled && g_of.contextCreated && g_of.resourcesReady && pPresentInfo->swapchainCount>0){
+        VkSwapchainKHR sw = pPresentInfo->pSwapchains[0];
+        uint32_t imgIndex = pPresentInfo->pImageIndices[0];
+        SwapchainInfo sci{}; bool have=false; { std::lock_guard<std::mutex> lock(g_mutex); auto sit=g_swapchains.find(sw); if(sit!=g_swapchains.end()){ sci = sit->second; have=true; } }
+        if(have && imgIndex < sci.images.size()){
+            dispatchOpticalFlowIfPossible(cmd, sci.images[imgIndex]);
+        }
+    }
 
     // For each swapchain/image in present
     for(uint32_t i=0;i<pPresentInfo->swapchainCount;++i){
@@ -655,6 +704,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instan
     if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0) return (PFN_vkVoidFunction) vkCreateSwapchainKHR;
     if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) return (PFN_vkVoidFunction) vkDestroySwapchainKHR;
     if (std::strcmp(pName, "vkGetSwapchainImagesKHR") == 0) return (PFN_vkVoidFunction) vkGetSwapchainImagesKHR;
+    if (std::strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0) return (PFN_vkVoidFunction) vkEnumerateDeviceExtensionProperties;
     if(g_nextGetInstanceProcAddr) return g_nextGetInstanceProcAddr(instance, pName);
     return nullptr;
 }
@@ -682,6 +732,61 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceLayerProperties(uin
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(VkPhysicalDevice, uint32_t* pPropertyCount, VkLayerProperties* pProperties) {
     return vkEnumerateInstanceLayerProperties(pPropertyCount, pProperties);
+}
+
+// Forwarder for device extension enumeration. Needed because the integrated FidelityFX backend
+// calls vkEnumerateDeviceExtensionProperties directly; without exporting this symbol from the
+// layer, the loader's handle validation could reject the physical device pointer (abort observed).
+// We resolve the next function via the stored instance dispatch or fall back to the global symbol.
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
+    VkPhysicalDevice physicalDevice,
+    const char* pLayerName,
+    uint32_t* pPropertyCount,
+    VkExtensionProperties* pProperties){
+    // Short-circuit: layer-name queries aren't about a physical device. Just delegate to any instance.
+    if(pLayerName != nullptr){
+        for(auto &instPair : g_instance_dispatch){
+            auto fp = instPair.second.EnumerateDeviceExtensionProperties;
+            if(fp) return fp(physicalDevice, pLayerName, pPropertyCount, pProperties);
+        }
+        // Fallback global
+    }
+
+    // Locate owning instance for physicalDevice by enumerating each known instance's physical devices.
+    VkInstance owningInst = VK_NULL_HANDLE;
+    PFN_vkEnumerateDeviceExtensionProperties nextFn = nullptr;
+    for(auto &instPair : g_instance_dispatch){
+        auto &idt = instPair.second;
+        if(!idt.EnumeratePhysicalDevices) continue;
+        uint32_t count = 0;
+        if(idt.EnumeratePhysicalDevices(instPair.first, &count, nullptr) != VK_SUCCESS || count == 0) continue;
+        std::vector<VkPhysicalDevice> phys(count);
+        if(idt.EnumeratePhysicalDevices(instPair.first, &count, phys.data()) != VK_SUCCESS) continue;
+        for(auto p : phys){ if(p == physicalDevice){ owningInst = instPair.first; nextFn = idt.EnumerateDeviceExtensionProperties; break; } }
+        if(owningInst) break;
+    }
+
+    if(!nextFn && g_nextGetInstanceProcAddr && owningInst){
+        // Attempt to get the next function directly for the owning instance (should normally be stored already).
+        nextFn = (PFN_vkEnumerateDeviceExtensionProperties) g_nextGetInstanceProcAddr(owningInst, "vkEnumerateDeviceExtensionProperties");
+    }
+
+    if(!nextFn && g_nextGetInstanceProcAddr){
+        // Absolute fallback: ask global (may return loader trampoline; acceptable if it chains properly).
+        nextFn = (PFN_vkEnumerateDeviceExtensionProperties) g_nextGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateDeviceExtensionProperties");
+    }
+
+    if(!nextFn){
+        void* lib = dlopen("libvulkan.so.1", RTLD_LAZY|RTLD_NOLOAD);
+        if(lib) nextFn = (PFN_vkEnumerateDeviceExtensionProperties) dlsym(lib, "vkEnumerateDeviceExtensionProperties");
+    }
+
+    if(!nextFn){
+        std::fprintf(stderr, "[test_vk] enumerateDeviceExt: resolve fail phys=%p owningInst=%p\n", (void*)physicalDevice, (void*)owningInst);
+        if(pPropertyCount){ *pPropertyCount = 0; }
+        return VK_ERROR_INITIALIZATION_FAILED; // Added braces to avoid misleading-indentation warning
+    }
+    return nextFn(physicalDevice, pLayerName, pPropertyCount, pProperties);
 }
 
 // Loader negotiation function (outside any other function scope)
