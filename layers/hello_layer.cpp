@@ -253,11 +253,21 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physicalDevice, c
         std::fprintf(stderr, "[test_vk] flags: overlay=%d opticalflow=%d\n", (int)g_enabled, (int)g_of_enabled);
     }
     if(g_of_enabled){
-        size_t scratchSize = ffxGetScratchMemorySizeVK(physicalDevice, FFX_OPTICALFLOW_CONTEXT_COUNT);
-        g_of.scratch.resize(scratchSize);
+        std::fprintf(stderr, "[test_vk] OF init: entering init block\n");
+        size_t scratchSize = 0;
+        std::fprintf(stderr, "[test_vk] OF init: calling ffxGetScratchMemorySizeVK\n");
+        scratchSize = ffxGetScratchMemorySizeVK(physicalDevice, FFX_OPTICALFLOW_CONTEXT_COUNT);
+        std::fprintf(stderr, "[test_vk] OF init: scratch size = %zu\n", scratchSize);
+        try { g_of.scratch.resize(scratchSize); } catch(...) { std::fprintf(stderr, "[test_vk] OF init: scratch resize threw\n"); }
+        std::fprintf(stderr, "[test_vk] OF init: creating device context struct\n");
         VkDeviceContext devCtx{ *pDevice, physicalDevice, g_nextGetDeviceProcAddr };
+        std::fprintf(stderr, "[test_vk] OF init: calling ffxGetDeviceVK\n");
         g_of.ffxDevice = ffxGetDeviceVK(&devCtx);
-        if(ffxGetInterfaceVK(&g_of.backendInterface, g_of.ffxDevice, g_of.scratch.data(), g_of.scratch.size(), FFX_OPTICALFLOW_CONTEXT_COUNT)==FFX_OK){
+    std::fprintf(stderr, "[test_vk] OF init: got ffxDevice handle (opaque ptr=%p) calling ffxGetInterfaceVK\n", (void*)g_of.ffxDevice);
+        FfxErrorCode ifaceResult = ffxGetInterfaceVK(&g_of.backendInterface, g_of.ffxDevice, g_of.scratch.data(), g_of.scratch.size(), FFX_OPTICALFLOW_CONTEXT_COUNT);
+        if(ifaceResult==FFX_OK){
+            // We don't ship frame generation subsystem; ensure pointer is null to avoid accidental calls.
+            g_of.backendInterface.fpSwapChainConfigureFrameGeneration = nullptr;
             log_debug("FFX backend interface OK");
         } else {
             log_debug("FFX backend interface FAILED");
